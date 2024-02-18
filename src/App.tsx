@@ -1,19 +1,66 @@
-import * as React from "react";
+import type { LoaderFunctionArgs } from "react-router-dom";
 import {
-  Routes,
-  Route,
+  Form,
   Link,
-  useNavigate,
-  useLocation,
-  Navigate,
   Outlet,
+  RouterProvider,
+  createBrowserRouter,
+  redirect,
+  useActionData,
+  useFetcher,
+  useLocation,
+  useNavigation,
+  useRouteLoaderData,
 } from "react-router-dom";
 import { fakeAuthProvider } from "./auth";
 
+const router = createBrowserRouter([
+  {
+    id: "root",
+    path: "/",
+    loader() {
+      // Our root route always provides the user, if logged in
+      return { user: fakeAuthProvider.username };
+    },
+    Component: Layout,
+    children: [
+      {
+        index: true,
+        Component: PublicPage,
+      },
+      {
+        path: "login",
+        action: loginAction,
+        loader: loginLoader,
+        Component: LoginPage,
+      },
+      {
+        path: "protected",
+        loader: protectedLoader,
+        Component: ProtectedPage,
+      },
+    ],
+  },
+  {
+    path: "/logout",
+    async action() {
+      // We signout in a "resource route" that we can hit from a fetcher.Form
+      await fakeAuthProvider.signout();
+      return redirect("/");
+    },
+  },
+]);
+
 export default function App() {
   return (
-    <AuthProvider>
-      <h1>Auth Example</h1>
+    <RouterProvider router={router} fallbackElement={<p>Initial Load...</p>} />
+  );
+}
+
+function Layout() {
+  return (
+    <div>
+      <h1>Auth Example using RouterProvider</h1>
 
       <p>
         This example demonstrates a simple login flow with three pages: a public
@@ -34,27 +81,6 @@ export default function App() {
         visited just *before* logging in, the public page.
       </p>
 
-      <Routes>
-        <Route element={<Layout />}>
-          <Route path="/" element={<PublicPage />} />
-          <Route path="/login" element={<LoginPage />} />
-          <Route
-            path="/protected"
-            element={
-              <RequireAuth>
-                <ProtectedPage />
-              </RequireAuth>
-            }
-          />
-        </Route>
-      </Routes>
-    </AuthProvider>
-  );
-}
-
-function Layout() {
-  return (
-    <div>
       <AuthStatus />
 
       <ul>
@@ -74,116 +100,107 @@ function Layout() {
   );
 }
 
-interface AuthContextType {
-  user: unknown;
-  signin: (user: string, callback: VoidFunction) => void;
-  signout: (callback: VoidFunction) => void;
-}
-
-const AuthContext = React.createContext<AuthContextType>(null!);
-
-function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = React.useState<unknown>(null);
-
-  const signin = (newUser: string, callback: VoidFunction) => {
-    return fakeAuthProvider.signin(() => {
-      setUser(newUser);
-      callback();
-    });
-  };
-
-  const signout = (callback: VoidFunction) => {
-    return fakeAuthProvider.signout(() => {
-      setUser(null);
-      callback();
-    });
-  };
-
-  const value = { user, signin, signout };
-
-  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
-}
-
-function useAuth() {
-  return React.useContext(AuthContext);
-}
-
 function AuthStatus() {
-  const auth = useAuth();
-  const navigate = useNavigate();
+  // Get our logged in user, if they exist, from the root route loader data
+  const { user } = useRouteLoaderData("root") as { user: string | null };
+  const fetcher = useFetcher();
 
-  if (!auth.user) {
+  if (!user) {
     return <p>You are not logged in.</p>;
   }
 
+  const isLoggingOut = fetcher.formData != null;
+
   return (
-    <p>
-      Welcome {auth?.user as JSX.Element}{" "}
-      <button
-        onClick={() => {
-          auth.signout(() => navigate("/"));
-        }}>
-        Sign out
-      </button>
-    </p>
+    <div>
+      <p>Welcome {user}!</p>
+      <fetcher.Form method="post" action="/logout">
+        <button type="submit" disabled={isLoggingOut}>
+          {isLoggingOut ? "Signing out..." : "Sign out"}
+        </button>
+      </fetcher.Form>
+    </div>
   );
 }
 
-function RequireAuth({ children }: { children: JSX.Element }) {
-  const auth = useAuth();
-  const location = useLocation();
+async function loginAction({ request }: LoaderFunctionArgs) {
+  const formData = await request.formData();
+  const username = formData.get("username") as string | null;
 
-  if (!auth.user) {
-    // Redirect them to the /login page, but save the current location they were
-    // trying to go to when they were redirected. This allows us to send them
-    // along to that page after they login, which is a nicer user experience
-    // than dropping them off on the home page.
-    return <Navigate to="/login" state={{ from: location }} replace />;
+  // Validate our form inputs and return validation errors via useActionData()
+  if (!username) {
+    return {
+      error: "You must provide a username to log in",
+    };
   }
 
-  return children;
+  // Sign in and redirect to the proper destination if successful.
+  try {
+    await fakeAuthProvider.signin(username);
+  } catch (error) {
+    // Unused as of now but this is how you would handle invalid
+    // username/password combinations - just like validating the inputs
+    // above
+    return {
+      error: "Invalid login attempt",
+    };
+  }
+
+  const redirectTo = formData.get("redirectTo") as string | null;
+  return redirect(redirectTo || "/");
+}
+
+async function loginLoader() {
+  if (fakeAuthProvider.isAuthenticated) {
+    return redirect("/");
+  }
+  return null;
 }
 
 function LoginPage() {
-  const navigate = useNavigate();
   const location = useLocation();
-  const auth = useAuth();
+  const params = new URLSearchParams(location.search);
+  const from = params.get("from") || "/";
 
-  const from = location.state?.from?.pathname || "/";
+  const navigation = useNavigation();
+  const isLoggingIn = navigation.formData?.get("username") != null;
 
-  function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-
-    const formData = new FormData(event.currentTarget);
-    const username = formData.get("username") as string;
-
-    auth.signin(username, () => {
-      // Send them back to the page they tried to visit when they were
-      // redirected to the login page. Use { replace: true } so we don't create
-      // another entry in the history stack for the login page.  This means that
-      // when they get to the protected page and click the back button, they
-      // won't end up back on the login page, which is also really nice for the
-      // user experience.
-      navigate(from, { replace: true });
-    });
-  }
+  const actionData = useActionData() as { error: string } | undefined;
 
   return (
     <div>
       <p>You must log in to view the page at {from}</p>
 
-      <form onSubmit={handleSubmit}>
+      <Form method="post" replace>
+        <input type="hidden" name="redirectTo" value={from} />
         <label>
-          Username: <input name="username" type="text" />
+          Username: <input name="username" />
         </label>{" "}
-        <button type="submit">Login</button>
-      </form>
+        <button type="submit" disabled={isLoggingIn}>
+          {isLoggingIn ? "Logging in..." : "Login"}
+        </button>
+        {actionData && actionData.error ? (
+          <p style={{ color: "red" }}>{actionData.error}</p>
+        ) : null}
+      </Form>
     </div>
   );
 }
 
 function PublicPage() {
   return <h3>Public</h3>;
+}
+
+function protectedLoader({ request }: LoaderFunctionArgs) {
+  // If the user is not logged in and tries to access `/protected`, we redirect
+  // them to `/login` with a `from` parameter that allows login to redirect back
+  // to this page upon successful authentication
+  if (!fakeAuthProvider.isAuthenticated) {
+    const params = new URLSearchParams();
+    params.set("from", new URL(request.url).pathname);
+    return redirect("/login?" + params.toString());
+  }
+  return null;
 }
 
 function ProtectedPage() {
